@@ -1,0 +1,290 @@
+import os
+import re
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import httpx
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Dict, Any
+
+# ==========================
+# Config
+# ==========================
+st.set_page_config(page_title="AI Hotel Booking Assistant", layout="wide")
+
+tiktoken_cache_dir = "./token"
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+
+# Azure/OpenAI client with SSL disabled (⚠️ not for production)
+client = httpx.Client(verify=False)
+
+# ==========================
+# Hotel Database
+# ==========================
+HOTELS = [
+    {"name": "Sea Breeze Resort", "price_adult": 4800, "price_child": 650, "currency": "INR",
+     "rating": 3.7, "location": "Goa", "amenities": ["sea front"], "sightseeing": ["Baga Beach", "Fort Aguada"]},
+    {"name": "Lakeview Serenity Hotel", "price_adult": 4200, "price_child": 600, "currency": "INR",
+     "rating": 4.2, "location": "Udaipur", "amenities": ["lake view"], "sightseeing": ["City Palace", "Lake Pichola"]},
+    {"name": "Budget Stay Central", "price_adult": 2500, "price_child": 500, "currency": "INR",
+     "rating": 3.0, "location": "New Delhi", "amenities": ["city center"], "sightseeing": ["India Gate", "Connaught Place"]},
+    {"name": "Mountain Escape Lodge", "price_adult": 3500, "price_child": 550, "currency": "INR",
+     "rating": 4.1, "location": "Manali", "amenities": ["mountain view"], "sightseeing": ["Solang Valley", "Hidimba Temple"]},
+    {"name": "Royal Heritage Palace", "price_adult": 5000, "price_child": 700, "currency": "INR",
+     "rating": 4.5, "location": "Jaipur", "amenities": ["luxury", "heritage"], "sightseeing": ["Amber Fort", "Hawa Mahal"]},
+]
+
+# ==========================
+# Utility Functions
+# ==========================
+def daywise_breakdown(hotel, check_in, check_out, adults=1, children=0):
+    start = datetime.strptime(check_in, "%Y-%m-%d")
+    end = datetime.strptime(check_out, "%Y-%m-%d")
+    nights = (end - start).days
+    if nights <= 0:
+        nights = 1
+
+    breakdown, total_fare = [], 0
+    for i in range(nights):
+        day = start + timedelta(days=i)
+        price_adult = hotel["price_adult"]
+        price_child = hotel["price_child"]
+
+        # weekend surcharge
+        if day.weekday() >= 5:
+            price_adult = int(price_adult * 1.2)
+            price_child = int(price_child * 1.2)
+
+        nightly_total = (adults * price_adult) + (children * price_child)
+        total_fare += nightly_total
+        breakdown.append({
+            "Date": day.strftime("%Y-%m-%d"),
+            "Price per Adult": price_adult,
+            "Price per Child": price_child,
+            "Total for Night": nightly_total,
+            "Currency": hotel["currency"]
+        })
+    return pd.DataFrame(breakdown), total_fare
+
+
+def hotels_to_text(hotels):
+    docs = []
+    for h in hotels:
+        text = (
+            f"Hotel: {h['name']}\n"
+            f"Location: {h['location']}\n"
+            f"Price Adult: {h['price_adult']} {h['currency']}\n"
+            f"Price Child: {h['price_child']} {h['currency']}\n"
+            f"Rating: {h['rating']}\n"
+            f"Amenities: {', '.join(h['amenities'])}\n"
+            f"Sightseeing nearby: {', '.join(h['sightseeing'])}\n"
+        )
+        docs.append(text)
+    return "\n\n".join(docs)
+
+
+def prepare_chunks(hotels):
+    text_data = hotels_to_text(hotels)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    return splitter.split_text(text_data)
+
+
+def extract_location(query):
+    for h in HOTELS:
+        if h["location"].lower() in query.lower():
+            return h["location"]
+    return None
+
+
+def dedup_hotels(docs_and_scores, candidate_hotels):
+    seen, unique = set(), []
+    for doc, score in docs_and_scores:
+        hname = doc.page_content.splitlines()[0].replace("Hotel: ", "")
+        if hname not in seen:
+            seen.add(hname)
+            hotel = next((h for h in candidate_hotels if h["name"] == hname), None)
+            if hotel:
+                unique.append((hotel, score))
+    return unique
+
+# ==========================
+# LangGraph State
+# ==========================
+class HotelState(TypedDict):
+    query: str
+    adults: int
+    children: int
+    check_in: str
+    check_out: str
+    budget: int
+    location: str
+    candidate_hotels: List[Dict[str, Any]]
+    retrieved_hotels: List[Any]
+    pricing: Dict[str, Any]
+    recommendation: str
+
+# ==========================
+# LangGraph Nodes
+# ==========================
+def parse_query(state: HotelState):
+    q = state["query"]
+    adults, children = 1, 0
+    m = re.search(r"(\d+)\s*adult(?:s)?", q, re.IGNORECASE)
+    if m: adults = int(m.group(1))
+    m = re.search(r"(\d+)\s*child(?:ren)?", q, re.IGNORECASE)
+    if m: children = int(m.group(1))
+
+    dates = re.findall(r"\d{4}-\d{2}-\d{2}", q)
+    check_in, check_out = None, None
+    if len(dates) >= 2: check_in, check_out = dates[0], dates[1]
+
+    budget = None
+    m = re.search(r"under\s*(\d+)", q, re.IGNORECASE)
+    if not m: m = re.search(r"below\s*(\d+)", q, re.IGNORECASE)
+    if not m: m = re.search(r"<=\s*(\d+)", q, re.IGNORECASE)
+    if m: budget = int(m.group(1))
+
+    location = extract_location(q)
+    return {"adults": adults, "children": children,
+            "check_in": check_in, "check_out": check_out,
+            "budget": budget, "location": location}
+
+
+def filter_hotels(state: HotelState):
+    candidate_hotels = HOTELS
+    if state["budget"]:
+        candidate_hotels = [h for h in candidate_hotels if h["price_adult"] <= state["budget"]]
+    if state["location"]:
+        location_hotels = [h for h in candidate_hotels if h["location"].lower() == state["location"].lower()]
+        if location_hotels: candidate_hotels = location_hotels
+    return {"candidate_hotels": candidate_hotels}
+
+
+def retrieve_hotels(state: HotelState):
+    emb = OpenAIEmbeddings(
+        base_url="https://xxxxxxx.xxxxxxxxxxxx.in",
+        model="azure/genailab-maas-text-embedding-3-large",
+        api_key="xxxxxxxxxxx",
+        http_client=client,
+    )
+    chunks = prepare_chunks(state["candidate_hotels"])
+    vs = Chroma.from_texts(chunks, emb)
+    docs_and_scores = vs.similarity_search_with_score(state["query"], k=5)
+    return {"retrieved_hotels": dedup_hotels(docs_and_scores, state["candidate_hotels"])}
+
+
+def add_pricing(state: HotelState):
+    pricing_info = {}
+    if state["check_in"] and state["check_out"]:
+        for hotel, score in state["retrieved_hotels"]:
+            df, total = daywise_breakdown(hotel, state["check_in"], state["check_out"],
+                                          state["adults"], state["children"])
+            pricing_info[hotel["name"]] = {"df": df, "total": total, "currency": hotel["currency"], "score": score}
+    return {"pricing": pricing_info}
+
+
+def recommend(state: HotelState):
+    chat_model = ChatOpenAI(
+        base_url="https://xxxxxxxxxx.xxxxxxxx.in",
+        model=selected_model,
+        api_key="xxxxxxxxxxxxx",
+        http_client=client,
+    )
+    context = "\n\n".join([f"Hotel: {h['name']}, Location: {h['location']}, Price Adult: {h['price_adult']}, Rating: {h['rating']}"
+                           for h, _ in state["retrieved_hotels"]])
+    fare_context = "\n".join([f"{k}: Total = {v['total']} {v['currency']} (score {v['score']:.3f})"
+                              for k, v in state["pricing"].items()])
+    answer = chat_model.invoke(
+        f"You are a hotel booking assistant. "
+        f"Only answer from the provided hotel context. "
+        f"Do not invent hotels.\n\n"
+        f"Context:\n{context}\n\n{fare_context}\n"
+        f"User request: {state['query']}"
+    )
+    return {"recommendation": answer.content}
+
+# ==========================
+# Build LangGraph
+# ==========================
+graph = StateGraph(HotelState)
+graph.add_node("parse", parse_query)
+graph.add_node("filter", filter_hotels)
+graph.add_node("retrieve", retrieve_hotels)
+graph.add_node("add_pricing", add_pricing)
+graph.add_node("recommend", recommend)
+graph.set_entry_point("parse")
+graph.add_edge("parse", "filter")
+graph.add_edge("filter", "retrieve")
+graph.add_edge("retrieve", "add_pricing")
+graph.add_edge("add_pricing", "recommend")
+graph.add_edge("recommend", END)
+
+app = graph.compile()  # ✅ removed checkpointer for simplicity
+
+# ==========================
+# Streamlit UI
+# ==========================
+st.title("🏨 AI Hotel Booking Assistant with LangGraph")
+
+available_models = [
+    "azure/genailab-maas-gpt-35-turbo",
+    "azure/genailab-maas-gpt-4o",
+    "azure/genailab-maas-gpt-4o-mini",
+    "azure/genailab-maas-text-embedding-3-large",
+    "azure/genailab-maas-whisper",
+    "azure_ai/genailab-maas-DeepSeek-R1",
+    "azure_ai/genailab-maas-DeepSeek-V3-0324",
+    "azure_ai/genailab-maas-Llama-3.2-90B-Vision-Instruct",
+    "azure_ai/genailab-maas-Llama-3.3-70B-Instruct",
+    "azure_ai/genailab-maas-Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "azure_ai/genailab-maas-Phi-3.5-vision-instruct",
+    "azure_ai/genailab-maas-Phi-4-reasoning",
+]
+
+selected_model = st.selectbox("🤖 Choose LLM model", available_models, index=1)
+
+query = st.text_input("💬 Enter your hotel request:")
+if query:
+    with st.spinner("🤖 Running hotel assistant..."):
+        result = app.invoke({"query": query})
+
+    # Show recommendation
+    st.subheader("🤖 AI Recommendation")
+    st.write(result["recommendation"])
+
+    # Show pricing tables
+    st.subheader("📊 Pricing Breakdown")
+    for hname, details in result["pricing"].items():
+        st.markdown(f"**{hname}** (Score: {details['score']:.3f})")
+        st.table(details["df"])
+        st.write(f"💰 Total: {details['total']} {details['currency']}")
+
+# ==========================
+# LangGraph Visualization with Graphviz
+# ==========================
+import graphviz
+st.subheader("🕸 LangGraph Workflow Visualization (Graphviz)")
+
+lg_graph = app.get_graph()  # returns Graph object
+nodes = lg_graph.nodes
+edges = lg_graph.edges  # list of lists
+
+# Build DOT manually
+dot_code = "digraph LangGraph {\nrankdir=LR;\n"
+for node_name in nodes:
+    dot_code += f'"{node_name}" [shape=box];\n'
+
+for edge in edges:
+    src = edge[0]
+    dst = edge[1]
+    dst_label = "END" if dst == END else dst
+    dot_code += f'"{src}" -> "{dst_label}";\n'
+
+dot_code += "}"
+
+st.graphviz_chart(dot_code)

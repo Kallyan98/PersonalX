@@ -1,0 +1,206 @@
+import os
+import re
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import httpx
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# ==========================
+# Config
+# ==========================
+st.set_page_config(page_title="AI Hotel Booking Assistant", layout="wide")
+
+tiktoken_cache_dir = "./token"
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+
+# Azure/OpenAI client with SSL disabled (⚠️ not for production)
+client = httpx.Client(verify=False)
+
+# ==========================
+# Hotel Database
+# ==========================
+HOTELS = [
+    {"name": "Sea Breeze Resort", "price_adult": 4800, "price_child": 650, "currency": "INR", "rating": 3.7,
+     "location": "Goa", "amenities": ["sea front"], "sightseeing": ["Baga Beach", "Fort Aguada"]},
+
+    {"name": "Lakeview Serenity Hotel", "price_adult": 4200, "price_child": 600, "currency": "INR", "rating": 4.2,
+     "location": "Udaipur", "amenities": ["lake view"], "sightseeing": ["City Palace", "Lake Pichola"]},
+
+    {"name": "Budget Stay Central", "price_adult": 2500, "price_child": 500, "currency": "INR", "rating": 3.0,
+     "location": "New Delhi", "amenities": ["city center"], "sightseeing": ["India Gate", "Connaught Place"]},
+
+    {"name": "Mountain Escape Lodge", "price_adult": 3500, "price_child": 550, "currency": "INR", "rating": 4.1,
+     "location": "Manali", "amenities": ["mountain view"], "sightseeing": ["Solang Valley", "Hidimba Temple"]},
+
+    {"name": "Royal Heritage Palace", "price_adult": 5000, "price_child": 700, "currency": "INR", "rating": 4.5,
+     "location": "Jaipur", "amenities": ["luxury", "heritage"], "sightseeing": ["Amber Fort", "Hawa Mahal"]},
+]
+
+# ==========================
+# Day-wise fare breakdown
+# ==========================
+def daywise_breakdown(hotel, check_in, check_out, adults=1, children=0):
+    start = datetime.strptime(check_in, "%Y-%m-%d")
+    end = datetime.strptime(check_out, "%Y-%m-%d")
+    nights = (end - start).days
+    if nights <= 0:
+        nights = 1
+
+    breakdown = []
+    total_fare = 0
+
+    for i in range(nights):
+        day = start + timedelta(days=i)
+        price_adult = hotel["price_adult"]
+        price_child = hotel["price_child"]
+
+        # weekend surcharge
+        if day.weekday() >= 5:
+            price_adult = int(price_adult * 1.2)
+            price_child = int(price_child * 1.2)
+
+        nightly_total = (adults * price_adult) + (children * price_child)
+        total_fare += nightly_total
+
+        breakdown.append({
+            "Date": day.strftime("%Y-%m-%d"),
+            "Price per Adult": price_adult,
+            "Price per Child": price_child,
+            "Total for Night": nightly_total,
+            "Currency": hotel["currency"]
+        })
+
+    return pd.DataFrame(breakdown), total_fare
+
+# ==========================
+# Convert hotel DB to text chunks
+# ==========================
+def hotels_to_text(hotels):
+    docs = []
+    for h in hotels:
+        text = (
+            f"Hotel: {h['name']}\n"
+            f"Location: {h['location']}\n"
+            f"Price Adult: {h['price_adult']} {h['currency']}\n"
+            f"Price Child: {h['price_child']} {h['currency']}\n"
+            f"Rating: {h['rating']}\n"
+            f"Amenities: {', '.join(h['amenities'])}\n"
+            f"Sightseeing nearby: {', '.join(h['sightseeing'])}\n"
+        )
+        docs.append(text)
+    return "\n\n".join(docs)
+
+def prepare_chunks(hotels):
+    text_data = hotels_to_text(hotels)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    return splitter.split_text(text_data)
+
+# ==========================
+# Embeddings + VectorStore
+# ==========================
+embedding_model = OpenAIEmbeddings(
+    base_url="https://genailab.XXXXX.in",
+    model="azure/genailab-maas-text-embedding-3-large",
+    api_key="XXXXX",
+    http_client=client,
+)
+
+CHROMA_DIR = "hotel_chroma"
+vectorstore = Chroma(
+    persist_directory=CHROMA_DIR,
+    embedding_function=embedding_model
+)
+
+# Store hotel data (once)
+chunks = prepare_chunks(HOTELS)
+if len(vectorstore.get()) == 0:
+    vectorstore.add_texts(chunks, metadatas=[{"source": "hotel_db"}] * len(chunks))
+    vectorstore.persist()
+
+# ==========================
+# Chat Model
+# ==========================
+chat_model = ChatOpenAI(
+    base_url="https://genailab.XXXXX.in",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key="XXXXX",
+    http_client=client,
+)
+
+# ==========================
+# Streamlit UI
+# ==========================
+st.title("🏨 AI Hotel Booking with Budget + Day-wise Pricing")
+st.write("Ask me about hotels — e.g., 'Suggest a hotel in Goa for 2 adults, 1 child from 2025-09-12 to 2025-09-15 under 6000 INR'")
+
+query = st.text_input("💬 Enter your request:")
+
+if query:
+    # Extract adults & children
+    adults, children = 1, 0
+    m = re.search(r"(\d+)\s*adults?", query, re.IGNORECASE)
+    if m: adults = int(m.group(1))
+    m = re.search(r"(\d+)\s*children?", query, re.IGNORECASE)
+    if m: children = int(m.group(1))
+
+    # Extract dates
+    dates = re.findall(r"\d{4}-\d{2}-\d{2}", query)
+    check_in, check_out = None, None
+    if len(dates) >= 2:
+        check_in, check_out = dates[0], dates[1]
+
+    # Extract budget
+    budget = None
+    m = re.search(r"under\s*(\d+)", query, re.IGNORECASE)
+    if not m:
+        m = re.search(r"below\s*(\d+)", query, re.IGNORECASE)
+    if not m:
+        m = re.search(r"<=\s*(\d+)", query, re.IGNORECASE)
+    if m:
+        budget = int(m.group(1))
+
+    # Filter hotels by budget (adult price only for simplicity)
+    candidate_hotels = HOTELS
+    if budget:
+        candidate_hotels = [h for h in HOTELS if h["price_adult"] <= budget]
+
+    if not candidate_hotels:
+        st.error("❌ No hotels found within your budget.")
+    else:
+        with st.spinner("🔎 Searching hotels..."):
+            chunks = prepare_chunks(candidate_hotels)
+            local_vectorstore = Chroma.from_texts(
+                chunks, embedding_model, metadatas=[{"source": "hotel_db"}] * len(chunks)
+            )
+
+            docs = local_vectorstore.similarity_search(query, k=3)
+            context = "\n\n".join([d.page_content for d in docs])
+
+            # Add fare breakdown if dates given
+            fare_context = ""
+            if check_in and check_out:
+                for d in docs:
+                    hname = d.page_content.splitlines()[0].replace("Hotel: ", "")
+                    hotel = next((h for h in candidate_hotels if h["name"] == hname), None)
+                    if hotel:
+                        df, total = daywise_breakdown(hotel, check_in, check_out, adults, children)
+                        st.subheader(f"📊 Day-wise pricing for {hname}")
+                        st.table(df)
+                        st.write(f"💰 Total fare: {total} {hotel['currency']}")
+                        fare_context += f"{hname}: Total Fare = {total} {hotel['currency']}\n"
+
+            answer = chat_model.invoke(
+                f"Context:\n{context}\n\n{fare_context}\n"
+                f"User request: {query}\n\n"
+                f"Answer as a hotel booking assistant. Only recommend hotels under budget (if given)."
+            )
+
+        st.subheader("🤖 AI Recommendation")
+        st.write(answer.content)
+
+        st.subheader("📌 Matched Hotels (Context)")
+        for d in docs:
+            st.markdown(f"- {d.page_content.splitlines()[0]}")

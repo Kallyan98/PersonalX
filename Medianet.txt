@@ -1,0 +1,272 @@
+# media_agent_final.txt
+
+import os
+import json
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from langchain_openai import ChatOpenAI
+import httpx
+import tempfile
+import subprocess
+import nltk
+import numpy as np
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+from sklearn.metrics import accuracy_score, log_loss
+# nltk.download()
+#nltk.download('punkt_tab')
+
+# DeepEval optional
+try:
+    from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
+except ImportError:
+    AnswerRelevancyMetric = FaithfulnessMetric = GEval = None
+
+# ------------------------
+# Config / Secrets
+# ------------------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "xxxxxxxxxxxx")
+BASE_URL = "https://xxxxxx.xxxxxxxxxx.in"
+
+os.environ["TIKTOKEN_CACHE_DIR"] = "./token"
+client = httpx.Client(verify=False, timeout=60.0)
+
+llm = ChatOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=BASE_URL,
+    model="azure/genailab-maas-gpt-4o",
+    http_client=client,
+    temperature=0.3
+)
+
+# ------------------------
+# Helpers
+# ------------------------
+def fetch_text_from_url(url: str) -> str:
+    try:
+        resp = requests.get(url, timeout=15, verify=False)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for s in soup(["script", "style", "noscript"]):
+            s.extract()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception as e:
+        st.error(f"Error fetching URL: {e}")
+        return ""
+
+def fetch_video_links(url: str) -> list:
+    try:
+        resp = requests.get(url, timeout=15, verify=False)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        video_links = []
+        for video in soup.find_all("video"):
+            src = video.get("src")
+            if src:
+                video_links.append(src)
+            for source in video.find_all("source"):
+                if source.get("src"):
+                    video_links.append(source.get("src"))
+        return list(set(video_links))
+    except Exception as e:
+        st.warning(f"Video extraction failed: {e}")
+        return []
+
+def transcribe_video(video_url: str) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
+            tmp_path = tmpfile.name
+        subprocess.run(["yt-dlp", "-o", tmp_path, video_url], check=True, capture_output=True)
+        return f"[Transcription of {video_url} placeholder]"
+    except Exception as e:
+        st.warning(f"Video transcription failed: {e}")
+        return ""
+
+def chunk_text(text: str, max_words=100000):
+    words = text.split()
+    for i in range(0, len(words), max_words):
+        yield " ".join(words[i:i+max_words])
+
+def summarize_chunk(content: str) -> dict:
+    prompt = (
+        "You are a media summarization and tagging assistant.\n"
+        "Instructions:\n"
+        "- Provide a factual summary (3–5 sentences).\n"
+        "- Extract 5–10 relevant tags/keywords.\n"
+        "- Do not invent information not present in the text (avoid hallucination).\n"
+        "- Do not include PII.\n"
+        "- Respond strictly in JSON with fields: summary (string), tags (list).\n\n"
+        f"Content:\n{content}"
+    )
+    response = llm.invoke([{"role": "user", "content": prompt}])
+    raw_text = response.content.strip()
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {"summary": raw_text, "tags": []}
+
+def summarize_and_tag(content: str) -> dict:
+    MAX_WORDS = 1_000_000
+    words = content.split()
+    if len(words) > MAX_WORDS:
+        raise ValueError(f"❌ Input too large: {len(words)} words. Limit {MAX_WORDS} words (~750k tokens).")
+
+    chunks = list(chunk_text(content, max_words=100000))
+    if len(chunks) == 1:
+        parsed = summarize_chunk(chunks[0])
+    else:
+        partial_summaries = []
+        all_tags = []
+        for idx, chunk in enumerate(chunks, start=1):
+            st.info(f"⏳ Processing batch {idx}/{len(chunks)}...")
+            parsed = summarize_chunk(chunk)
+            partial_summaries.append(parsed["summary"])
+            all_tags.extend(parsed["tags"])
+        all_tags = list(dict.fromkeys([t.strip() for t in all_tags if t.strip()]))
+        aggregate_prompt = (
+            "You are a summarization aggregator.\n"
+            "Combine partial summaries into 5–7 sentences.\n"
+            "Consolidate tags into 5–10 relevant keywords.\n"
+            "Do not hallucinate.\n"
+            "Respond strictly in JSON with fields: summary, tags.\n\n"
+            f"Partial Summaries:\n{json.dumps(partial_summaries, indent=2)}\n\n"
+            f"Collected Tags:\n{json.dumps(all_tags, indent=2)}"
+        )
+        response = llm.invoke([{"role": "user", "content": aggregate_prompt}])
+        raw_text = response.content.strip()
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            parsed = {"summary": " ".join(partial_summaries), "tags": all_tags}
+
+    tags_markdown = " ".join([f"`{t}`" for t in parsed.get("tags", [])])
+    pretty = f"**Summary:**\n{parsed.get('summary','')}\n\n**Tags:** {tags_markdown}"
+    return {"summary": parsed.get("summary",""), "tags": parsed.get("tags",[]), "summary_and_tags": pretty}
+
+def compute_unified_metrics(input_text: str, generated_summary: str) -> dict:
+    ref_tokens = nltk.word_tokenize(input_text)
+    hyp_tokens = nltk.word_tokenize(generated_summary)
+
+    smoothie = SmoothingFunction().method4
+    bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smoothie)
+    meteor = meteor_score([ref_tokens], hyp_tokens)
+    rouge = rouge_scorer.RougeScorer(['rouge1','rougeL'], use_stemmer=True)
+    rouge_scores = rouge.score(input_text, generated_summary)
+
+    # ✅ Fix for sklearn warnings
+    # acc = accuracy_score([1], [1], labels=[0,1])  
+    # ppl = np.exp(log_loss([1], [[0.5,0.5]], labels=[0,1]))
+
+    fluency = len(hyp_tokens)/(len(hyp_tokens)+1)
+    coherence = rouge_scores["rougeL"].fmeasure
+
+    bias_score = faithfulness_score = geval_score = None
+    if AnswerRelevancyMetric and FaithfulnessMetric and GEval:
+        try: bias_score = AnswerRelevancyMetric().measure(input_text, generated_summary)
+        except: pass
+        try: faithfulness_score = FaithfulnessMetric().measure(input_text, generated_summary)
+        except: pass
+        try: geval_score = GEval().measure(input_text, generated_summary)
+        except: pass
+
+    llm_prompt = (
+    "You are an evaluation assistant. Evaluate the summary strictly in JSON format with keys: "
+    "'factuality', 'coherence', 'conciseness', 'coverage'. Values must be numbers between 0 and 1.\n"
+    f"Original text:\n{input_text[:2000]}\nSummary:\n{generated_summary}\n"
+    "Respond strictly with valid JSON only, nothing else."
+    )
+    try:
+        response = llm.invoke([{"role":"user","content":llm_prompt}])
+        print("LLM raw output:", response.content)   # <--- debug
+        llm_check = json.loads(response.content.strip())
+    except Exception as e:
+        print("LLM evaluation failed:", e)          # <--- debug
+        llm_check = {"factuality": None,"coherence": None,"conciseness": None,"coverage": None}
+
+
+
+    return {
+        "Accuracy & Performance": {
+            "BLEU": bleu,
+            "ROUGE-1": rouge_scores["rouge1"].fmeasure,
+            "ROUGE-L": rouge_scores["rougeL"].fmeasure,
+            "METEOR": meteor
+        },
+        "Language & Quality": {"Fluency": fluency, "Coherence": coherence},
+        "Bias & Fairness": {"Answer Relevancy": bias_score},
+        "Content Quality": {
+            "Faithfulness": faithfulness_score,
+            "Relevance": rouge_scores["rouge1"].recall,
+            "Diversity": len(set(hyp_tokens))/(len(hyp_tokens)+1)
+        },
+        "Model-Based Evaluation": {"G-Eval": geval_score},
+        "LLM Self-Check": llm_check
+    }
+
+# ------------------------
+# Streamlit UI
+# ------------------------
+st.set_page_config(page_title="Media Summarization & Metrics", layout="wide")
+st.title("📰 Media Summarization & Metrics Agent")
+
+st.markdown("""
+1️⃣ Paste text or provide URL  
+2️⃣ Summarization + tags + metrics will be generated
+""")
+
+input_mode = st.radio("Choose input type:", ["Raw Text", "URL"])
+raw_text = ""
+
+if input_mode=="Raw Text":
+    raw_text = st.text_area("Paste media text here", height=300)
+else:
+    url = st.text_input("Enter URL to media content")
+    if url:
+        with st.spinner("Fetching content..."):
+            text_part = fetch_text_from_url(url)
+            videos = fetch_video_links(url)
+            video_texts = []
+            for v in videos:
+                t = transcribe_video(v)
+                if t: video_texts.append(t)
+            raw_text = text_part + "\n" + "\n".join(video_texts)
+            raw_text = st.text_area("Fetched / transcribed text", raw_text[:2000]+("..." if len(raw_text)>2000 else ""), height=300)
+
+if raw_text.strip():
+    words = len(raw_text.split())
+    tokens = int(words/0.75)
+    st.markdown(f"**Word count:** {words:,} | **Approx. tokens:** {tokens:,}")
+    if words>1_000_000: st.error("❌ Input too large")
+    else: st.success("✅ Input size OK")
+
+if st.button("⚡ Generate Summary & Metrics"):
+    if not raw_text.strip(): st.warning("Provide text or URL")
+    else:
+        with st.spinner("Processing..."):
+            try:
+                result = summarize_and_tag(raw_text)
+                st.subheader("📝 Summary")
+                st.markdown(result["summary_and_tags"])
+                
+                # Display tags as badges
+                st.subheader("🏷️ Tags")
+                st.markdown(" ".join([f"`{t}`" for t in result["tags"]]))
+                
+                # Evaluation metrics
+                st.subheader("📊 Metrics")
+                metrics = compute_unified_metrics(raw_text, result["summary"])
+                st.json(metrics)
+
+                # JSON downloads
+                st.download_button("📥 Download summary+tags JSON",
+                                   data=json.dumps({"summary":result["summary"],"tags":result["tags"]},indent=2),
+                                   file_name="summary_tags.json",
+                                   mime="application/json")
+                st.download_button("📥 Download full output JSON",
+                                   data=json.dumps(result,indent=2),
+                                   file_name="full_output.json",
+                                   mime="application/json")
+            except ValueError as ve: st.error(f"❌ {ve}")
+            except Exception as e: st.error(f"⚠️ Something went wrong: {e}")

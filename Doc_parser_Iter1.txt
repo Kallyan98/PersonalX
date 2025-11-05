@@ -1,0 +1,127 @@
+import os
+import streamlit as st
+import pdfminer.high_level
+from docx import Document
+from pptx import Presentation
+from bs4 import BeautifulSoup
+import pandas as pd
+import json
+import xml.etree.ElementTree as ET
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+import httpx
+
+# Fix: Proper cache directory path
+tiktoken_cache_dir = "./token"
+os.environ["TIKTOKEN_CACHE_DIR"] = tiktoken_cache_dir
+
+# Disable SSL verification (not recommended for production)
+client = httpx.Client(verify=False)
+
+# --- Helper: extract text ---
+def extract_text_from_file(uploaded_file):
+    file_name = uploaded_file.name.lower()
+
+    if file_name.endswith(".pdf"):
+        uploaded_file.seek(0)
+        return pdfminer.high_level.extract_text(uploaded_file)
+
+    elif file_name.endswith(".docx"):
+        doc = Document(uploaded_file)
+        return "\n".join([para.text for para in doc.paragraphs])
+
+    elif file_name.endswith(".txt"):
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
+    elif file_name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+        return df.to_string()
+
+    elif file_name.endswith(".xlsx"):
+        df = pd.read_excel(uploaded_file)
+        return df.to_string()
+
+    elif file_name.endswith(".pptx"):
+        prs = Presentation(uploaded_file)
+        return "\n".join(
+            shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")
+        )
+
+    elif file_name.endswith((".html", ".htm")):
+        html_content = uploaded_file.read().decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(html_content, "html.parser")
+        return soup.get_text(separator="\n")
+
+    elif file_name.endswith(".json"):
+        data = json.load(uploaded_file)
+        return json.dumps(data, indent=2)
+
+    elif file_name.endswith(".xml"):
+        tree = ET.parse(uploaded_file)
+        root = tree.getroot()
+        return ET.tostring(root, encoding="unicode", method="xml")
+
+    return "[Unsupported file type]"
+
+# --- Chunking ---
+def chunk_text(text, chunk_size=1000, chunk_overlap=200):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_text(text)
+
+# --- Azure Embeddings ---
+embedding_model = OpenAIEmbeddings(
+    base_url="https://genailab.XXXXX.in",
+    model="azure/genailab-maas-text-embedding-3-large",
+    api_key="XXXXXXXX",
+    http_client=client
+)
+
+# --- Persistent Chroma Setup ---
+CHROMA_DIR = "chroma_store"
+vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding_model)
+
+# --- Azure Chat Model ---
+chat_model = ChatOpenAI(
+    base_url="https://genailab.XXXXX.in",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key="XXXXXXXXX",
+    http_client=client
+)
+
+# --- Streamlit UI ---
+st.set_page_config(page_title="Universal Doc Summarizer + Azure RAG", layout="wide")
+st.title("📑 Universal Document Summarizer with Azure AI + ChromaDB")
+
+uploaded_file = st.file_uploader(
+    "Upload a document",
+    type=["pdf", "docx", "pptx", "html", "htm", "txt", "csv", "xlsx", "json", "xml"]
+)
+
+if uploaded_file:
+    st.info("Extracting text from uploaded file...")
+    doc_text = extract_text_from_file(uploaded_file)
+    chunks = chunk_text(doc_text)
+
+    st.subheader("Extracted Text Preview")
+    st.text_area("Content", doc_text[:2000] + ("..." if len(doc_text) > 2000 else ""), height=300)
+
+    if st.button("📥 Save to Vector DB"):
+        vectorstore.add_texts(chunks, metadatas=[{"source": uploaded_file.name}] * len(chunks))
+        vectorstore.persist()
+        st.success(f"✅ Stored {len(chunks)} chunks from {uploaded_file.name} into ChromaDB.")
+
+# --- Query Section ---
+st.subheader("🔎 Ask Questions about Stored Documents")
+query = st.text_input("Enter your question")
+if query:
+    docs = vectorstore.similarity_search(query, k=4)
+    context = "\n\n".join([d.page_content for d in docs])
+
+    with st.spinner("Thinking..."):
+        answer = chat_model.invoke(
+            f"Answer the question based on the context:\n{context}\n\nQuestion: {query}"
+        )
+
+    st.subheader("💡 Answer")
+    st.write(answer.content)
