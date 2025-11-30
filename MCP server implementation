@@ -1,0 +1,163 @@
+import os
+import requests
+import json
+from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv() # Load environment variables
+
+mcp = FastMCP("flight_status_tracker")
+API_BASE_URL = "api.aviationstack.com"
+API_KEY = os.environ.get("AVIATION_API_KEY")
+
+@mcp.tool()
+def get_flight_status(flight_iata: str) -> str:
+    """
+    Fetches real-time status and details for a specific flight using its IATA code (e.g., AA123).
+    
+    Args:
+        flight_iata: The IATA flight code.
+    
+    Returns:
+        A JSON string with flight details or an error message.
+    """
+    if not API_KEY:
+        return "Error: Aviation API key not found."
+
+    url = f"{API_BASE_URL}/flights"
+    params = {'access_key': API_KEY, 'flight_iata': flight_iata}
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if data and 'data' in data and data['data']:
+            # Return the first flight's relevant data as a JSON string
+            flight = data['data'][0] 
+            return json.dumps({
+                "status": flight.get('flight_status', 'Unknown'),
+                "departure_airport": flight.get('departure', {}).get('airport', 'N/A'),
+                "arrival_airport": flight.get('arrival', {}).get('airport', 'N/A'),
+                "scheduled_departure": flight.get('departure', {}).get('scheduled', 'N/A')
+            })
+        else:
+            return f"No data found for flight {flight_iata}."
+    except requests.exceptions.RequestException as e:
+        return f"Error connecting to flight API: {e}"
+
+if __name__ == "__main__":
+    print("Starting Flight Status MCP Server (stdio transport)...")
+    # Run using standard I/O so LangChain can manage it
+    mcp.run(transport="stdio")
+
+
+
+import json
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("flight_recommendation_engine")
+
+@mcp.tool()
+def find_alternative_flights(departure_airport: str, arrival_airport: str, date: str) -> str:
+    """
+    Suggests alternative flight options based on departure/arrival info and date.
+    
+    Args:
+        departure_airport: IATA code for departure airport (e.g., JFK).
+        arrival_airport: IATA code for arrival airport (e.g., LAX).
+        date: The travel date (YYYY-MM-DD).
+
+    Returns:
+        A JSON string listing alternative flights.
+    """
+    # This is a mock implementation; a real version would use a flight search API
+    mock_alternatives = [
+        {"flight": "DL456", "time": "08:00 AM", "price": "$350"},
+        {"flight": "UA789", "time": "10:30 AM", "price": "$320"}
+    ]
+    return json.dumps(mock_alternatives)
+
+if __name__ == "__main__":
+    print("Starting Recommendation MCP Server (stdio transport)...")
+    mcp.run(transport="stdio")
+
+
+
+
+{
+  "mcpServers": {
+    "flight-status-tracker": {
+      "command": "python",
+      "args": ["flight_status_server.py"],
+      "transport": "stdio"
+    },
+    "flight-recommendation-engine": {
+      "command": "python",
+      "args": ["recommendation_server.py"],
+      "transport": "stdio"
+    }
+  }
+}
+
+
+
+import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_mcp_adapters import build_langchain_tools_from_mcp, run_agent_with_mcp_client
+
+load_dotenv() # Load environment variables
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+async def run_flight_agent(user_query: str):
+    """
+    Orchestrates the flight agent workflow using MCP tools via LangChain.
+    """
+    print(f"User Query: {user_query}\n")
+
+    # 1. Dynamically load tools from the mcp_config.json file
+    # This function starts the MCP servers in the background
+    mcp_tools = await build_langchain_tools_from_mcp(mcp_config_path="./mcp_config.json")
+    
+    print(f"Loaded tools: {[tool.name for tool in mcp_tools]}\n")
+
+    # 2. Set up the LLM (using OpenAI's function calling optimized model)
+    llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0, api_key=OPENAI_API_KEY)
+
+    # 3. Define the agent prompt
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an expert flight assistant. Use the provided tools to check flight statuses and recommend alternatives."),
+        MessagesPlaceholder(variable_name="chat_history", optional=True),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad")
+    ])
+
+    # 4. Create the LangChain agent
+    agent = create_openai_tools_agent(llm, mcp_tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=mcp_tools, verbose=True)
+
+    # 5. Run the agent and get the final response
+    result = await agent_executor.invoke({"input": user_query})
+    print("\n--- Final Agent Response ---")
+    print(result['output'])
+
+if __name__ == "__main__":
+    # The MCP client handling must be run in an async environment
+    import asyncio
+    
+    # Example 1: Simple status check
+    asyncio.run(run_flight_agent("Is flight AA123 on time?"))
+
+    # Example 2: Status check and recommendation (requires both tools to work)
+    # asyncio.run(run_flight_agent("My flight AA123 is delayed. Find me some alternative flights from JFK to LAX for tomorrow."))
+
+
+
+pip install langchain langchain-openai fastmcp requests python-dotenv
+flight_status_server.py
+recommendation_server.py 
+mcp_config.json
+main_agent.py
