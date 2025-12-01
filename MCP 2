@@ -1,0 +1,239 @@
+import os
+import json
+from datetime import datetime, timedelta
+
+import requests
+from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv()
+
+mcp = FastMCP("disruption_advisor")
+
+# API keys (all from env; never hardcode)
+AVIATION_API_KEY = os.environ.get("AVIATION_API_KEY")
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")
+TRAFFIC_API_KEY = os.environ.get("TRAFFIC_API_KEY")
+SMS_API_KEY = os.environ.get("SMS_API_KEY")  # e.g., Twilio / other provider
+
+AVIATION_BASE_URL = "https://api.aviationstack.com/v1"
+WEATHER_BASE_URL = "https://api.open-meteo.com/v1"  # example
+TRAFFIC_BASE_URL = "https://api.traffic.example.com/v1"  # placeholder
+SMS_BASE_URL = "https://api.sms.example.com/v1"  # placeholder
+
+
+def _safe_get_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _http_get(url: str, params: dict) -> dict:
+    """Small helper for GET with basic error handling."""
+    try:
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        # In production, log this instead of raising plain text
+        raise RuntimeError(f"Upstream API error: {e}")
+
+
+@mcp.tool()
+def get_flight_status(flight_iata: str) -> str:
+    """
+    Fetch real-time status and disruption indicators for a flight.
+    """
+    _safe_get_env("AVIATION_API_KEY")  # will raise if missing
+
+    url = f"{AVIATION_BASE_URL}/flights"
+    params = {"access_key": AVIATION_API_KEY, "flight_iata": flight_iata}
+
+    data = _http_get(url, params)
+
+    flights = data.get("data") or []
+    if not flights:
+        return json.dumps({"ok": False, "reason": f"No data for {flight_iata}"})
+
+    flight = flights[0]
+
+    dep = flight.get("departure", {}) or {}
+    arr = flight.get("arrival", {}) or {}
+
+    # Simple disruption features
+    status = flight.get("flight_status", "unknown")
+    scheduled_dep = dep.get("scheduled")
+    actual_dep = dep.get("actual")
+
+    delay_minutes = None
+    if scheduled_dep and actual_dep:
+        try:
+            s = datetime.fromisoformat(scheduled_dep.replace("Z", "+00:00"))
+            a = datetime.fromisoformat(actual_dep.replace("Z", "+00:00"))
+            delay_minutes = int((a - s).total_seconds() / 60)
+        except Exception:
+            delay_minutes = None
+
+    disruption_score = 0
+    if status in {"cancelled", "diverted"}:
+        disruption_score = 100
+    elif status in {"delayed"}:
+        disruption_score = 70
+    elif delay_minutes and delay_minutes > 30:
+        disruption_score = 60
+
+    result = {
+        "ok": True,
+        "flight_iata": flight_iata,
+        "status": status,
+        "departure_airport": dep.get("airport"),
+        "arrival_airport": arr.get("airport"),
+        "scheduled_departure": scheduled_dep,
+        "actual_departure": actual_dep,
+        "delay_minutes": delay_minutes,
+        "disruption_score": disruption_score,
+    }
+    return json.dumps(result)
+
+
+@mcp.tool()
+def get_weather_at_airport(lat: float, lon: float) -> str:
+    """
+    Get current weather at a given coordinate (approximate airport position).
+    """
+    _safe_get_env("WEATHER_API_KEY")  # optional if API is keyless; keep pattern
+
+    # Example: open-meteo style API (adapt to your provider)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current_weather": True,
+    }
+    url = f"{WEATHER_BASE_URL}/forecast"
+    data = _http_get(url, params)
+
+    current = data.get("current_weather", {}) or {}
+
+    result = {
+        "ok": True,
+        "lat": lat,
+        "lon": lon,
+        "temperature": current.get("temperature"),
+        "windspeed": current.get("windspeed"),
+        "weather_code": current.get("weathercode"),
+    }
+    return json.dumps(result)
+
+
+@mcp.tool()
+def get_route_traffic(origin: str, destination: str) -> str:
+    """
+    Get traffic info between two locations (e.g., airport and city center).
+    origin/destination: free-text or place IDs depending on provider.
+    """
+    _safe_get_env("TRAFFIC_API_KEY")
+
+    url = f"{TRAFFIC_BASE_URL}/route"
+    params = {
+        "key": TRAFFIC_API_KEY,
+        "origin": origin,
+        "destination": destination,
+    }
+    data = _http_get(url, params)
+
+    # Shape the response into disruption-relevant info
+    route = data.get("route", {}) or {}
+
+    result = {
+        "ok": True,
+        "origin": origin,
+        "destination": destination,
+        "eta_minutes": route.get("eta_minutes"),
+        "congestion_level": route.get("congestion_level"),
+        "incidents": route.get("incidents", []),
+    }
+    return json.dumps(result)
+
+
+@mcp.tool()
+def send_disruption_alert(
+    channel: str,
+    destination: str,
+    message: str
+) -> str:
+    """
+    Send an alert via SMS or email when a disruption is detected.
+    channel: 'sms' or 'email'
+    destination: phone number or email address
+    message: alert body
+    """
+    if channel == "sms":
+        _safe_get_env("SMS_API_KEY")
+        url = f"{SMS_BASE_URL}/send"
+        payload = {
+            "api_key": SMS_API_KEY,
+            "to": destination,
+            "message": message,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=8)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            return json.dumps({"ok": False, "reason": f"SMS error: {e}"})
+        return json.dumps({"ok": True, "channel": "sms", "to": destination})
+
+    # For hackathon scope, email can be a stub or use another provider
+    return json.dumps({
+        "ok": False,
+        "reason": "Email channel not yet implemented",
+    })
+
+
+@mcp.tool()
+def recommend_action_for_flight(flight_iata: str) -> str:
+    """
+    High-level advisor tool:
+    - Calls get_flight_status internally (or via client in a real multi-agent setup).
+    - Returns a simple recommendation text and severity level.
+    """
+    # In a “pure MCP” world, the orchestrating agent would call tools separately.
+    # For hackathon speed, we call our own function directly.
+    flight_raw = json.loads(get_flight_status(flight_iata))
+
+    if not flight_raw.get("ok"):
+        return json.dumps({
+            "ok": False,
+            "reason": flight_raw.get("reason", "Unknown error"),
+        })
+
+    score = flight_raw.get("disruption_score") or 0
+    status = flight_raw.get("status")
+
+    if score >= 100:
+        severity = "critical"
+        advice = "Flight cancelled/diverted: proactively rebook passengers and notify all downstream connections."
+    elif score >= 70:
+        severity = "high"
+        advice = "Significant delay: prioritize rebooking options and notify passengers with updated ETAs."
+    elif score >= 40:
+        severity = "medium"
+        advice = "Moderate disruption: monitor closely and prepare contingency routing, but no immediate action required."
+    else:
+        severity = "low"
+        advice = "No major disruption detected: continue normal monitoring."
+
+    result = {
+        "ok": True,
+        "flight_iata": flight_iata,
+        "severity": severity,
+        "status": status,
+        "disruption_score": score,
+        "advice": advice,
+    }
+    return json.dumps(result)
+
+
+if __name__ == "__main__":
+    print("Starting Disruption Advisor MCP Server (stdio transport)...")
+    mcp.run(transport="stdio")
